@@ -1,0 +1,16 @@
+# define new VM container 
+
+sed -e 's/<name>.*<\/name>/<name>new-vm<\/name>/' \
+    -e '/<uuid>/d' \
+    -e '/<mac address/d' \
+    -e "s|source file='.*'|source file='/path/to/new-disk.qcow2'|" \
+    my_vm_export.xml > ready_to_import.xml
+
+virsh define ready_to_import.xml
+
+
+# bind device 
+lspci | grep -i vmware
+sudo modprobe vfio-pci
+echo "0000:02:00.0" | sudo tee /sys/bus/pci/devices/0000:02:00.0/driver/unbind
+echo "15ad 07b0" | sudo tee /sys/bus/pci/drivers/vfio-pci/new_id
