@@ -7,10 +7,10 @@
 #include <unistd.h>
 #include <libgen.h>
 #include <limits.h>
+#include <stdint.h>
 
 /**
- * Helper: Find the IOMMU group ID by reading the symlink in sysfs
- * Path: /sys/bus/pci/devices/<addr>/iommu_group -> ../../../kernel/iommu_groups/<id>
+ * Helper: Find the IOMMU group ID from sysfs
  */
 int get_group_id(const char *pci_addr) {
     char path[PATH_MAX];
@@ -23,15 +23,12 @@ int get_group_id(const char *pci_addr) {
         return -1;
     }
     link[len] = '\0';
-    
-    // basename() gets the last part of the path (the ID)
     return atoi(basename(link));
 }
 
 int main(int argc, char *argv[]) {
     if (argc < 2) {
         printf("Usage: %s <pci_address>\n", argv[0]);
-        printf("Example: %s 0000:02:00.0\n", argv[0]);
         return 1;
     }
 
@@ -49,20 +46,16 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 2. Open the discovered Group and attach to container
+    // 2. Open Group and attach to container
     snprintf(group_path, sizeof(group_path), "/dev/vfio/%d", group_id);
     group = open(group_path, O_RDWR);
     if (group < 0) {
         perror("Failed to open group");
         return 1;
     }
-    
-    if (ioctl(group, VFIO_GROUP_SET_CONTAINER, &container) < 0) {
-        perror("Failed to set container");
-        return 1;
-    }
+    ioctl(group, VFIO_GROUP_SET_CONTAINER, &container);
 
-    // 3. Set IOMMU type (Type 1 is standard for x86)
+    // 3. Set IOMMU type (VFIO_TYPE1_IOMMU is standard for x86)
     if (ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU) < 0) {
         perror("Failed to set IOMMU type");
         return 1;
@@ -75,11 +68,11 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 5. Query Identification from PCI Config Space
+    // 5. Query Identification
     struct vfio_region_info config_reg = { .argsz = sizeof(config_reg), .index = VFIO_PCI_CONFIG_REGION_INDEX };
     ioctl(device, VFIO_DEVICE_GET_REGION_INFO, &config_reg);
 
-    unsigned short vendor_id, device_id;
+    uint16_t vendor_id, device_id;
     pread(device, &vendor_id, 2, config_reg.offset + 0);
     pread(device, &device_id, 2, config_reg.offset + 2);
 
@@ -87,7 +80,7 @@ int main(int argc, char *argv[]) {
     printf("Vendor ID: 0x%04X (VMware)\n", vendor_id);
     printf("Device ID: 0x%04X (VMXNET3 Virtual Ethernet)\n", device_id);
 
-    // 6. Query and Map BAR0 (Region 0) - Hardware Registers
+    // 6. Query and Map BAR0 (Registers)
     struct vfio_region_info bar0_reg = { .argsz = sizeof(bar0_reg), .index = 0 };
     ioctl(device, VFIO_DEVICE_GET_REGION_INFO, &bar0_reg);
 
@@ -102,7 +95,38 @@ int main(int argc, char *argv[]) {
         printf("BAR0 Mapped at: %p\n", bar0_ptr);
     }
 
+    // 7. DMA Setup: Allocate and Map memory for the hardware
+    size_t dma_size = 4096 * 4; // Allocate 4 pages (16KB)
+    void *dma_vaddr = mmap(NULL, dma_size, PROT_READ | PROT_WRITE,
+                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED, -1, 0);
+
+    if (dma_vaddr == MAP_FAILED) {
+        perror("DMA mmap failed");
+    } else {
+        struct vfio_iommu_type1_dma_map dma_map = {
+            .argsz = sizeof(dma_map),
+            .vaddr = (uintptr_t)dma_vaddr,
+            .size  = dma_size,
+            .iova  = 0x1000000, // IO Virtual Address starts at 16MB
+            .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
+        };
+
+        if (ioctl(container, VFIO_IOMMU_MAP_DMA, &dma_map) < 0) {
+            perror("VFIO_IOMMU_MAP_DMA failed");
+        } else {
+            printf("\n=== DMA Setup ===\n");
+            printf("DMA Buffer Allocated: %zu bytes\n", dma_size);
+            printf("Userspace Vaddr:      %p\n", dma_vaddr);
+            printf("Device IOVA:          0x%llx\n", dma_map.iova);
+        }
+    }
+
+    // Keep the program running for a moment so you can inspect /proc/self/maps
+    printf("\nPress Enter to exit and cleanup...");
+    getchar();
+
     // Cleanup
+    if (dma_vaddr != MAP_FAILED) munmap(dma_vaddr, dma_size);
     if (bar0_ptr != MAP_FAILED) munmap(bar0_ptr, bar0_reg.size);
     close(device);
     close(group);
