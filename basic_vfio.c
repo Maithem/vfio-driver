@@ -8,129 +8,125 @@
 #include <libgen.h>
 #include <limits.h>
 #include <stdint.h>
+#include <string.h>
 
-/**
- * Helper: Find the IOMMU group ID from sysfs
- */
+/* VMXNET3 Constants */
+#define VMXNET3_REG_VRRS  0x000  // Version Report Selection
+#define VMXNET3_REG_CMD   0x010  // Command Register
+#define VMXNET3_REG_MACL  0x018  // MAC Address Low
+#define VMXNET3_REG_MACH  0x020  // MAC Address High
+
+#define VMXNET3_CMD_FIRST_SET    0xCF000000
+#define VMXNET3_CMD_ACTIVATE_DEV (VMXNET3_CMD_FIRST_SET + 0)
+#define VMXNET3_CMD_RESET_DEV    (VMXNET3_CMD_FIRST_SET + 1)
+#define VMXNET3_CMD_GET_MAC      (VMXNET3_CMD_FIRST_SET + 4)
+
+#define RING_SIZE 128
+
+/* Structs must be packed for hardware compatibility */
+typedef struct Vmxnet3_TxDesc {
+    uint64_t addr;
+    uint32_t len : 14, gen : 1, res1 : 17;
+    uint32_t res2;
+} __attribute__((__packed__)) Vmxnet3_TxDesc;
+
+typedef struct Vmxnet3_RxDesc {
+    uint64_t addr;
+    uint32_t len : 14, btype : 1, gen : 1, res1 : 16;
+    uint32_t res2;
+} __attribute__((__packed__)) Vmxnet3_RxDesc;
+
+// Simplified Driver Shared structure for activation
+typedef struct Vmxnet3_DriverShared {
+    uint32_t magic;
+    uint32_t pad1;
+    uint64_t dev_addr;    // IOVA of this struct
+    uint64_t diag_addr;
+    uint32_t vcpu_conf_addr;
+    uint32_t vcpu_conf_len;
+    // In a real driver, much more goes here (interrupts, ring locations)
+} __attribute__((__packed__)) Vmxnet3_DriverShared;
+
 int get_group_id(const char *pci_addr) {
-    char path[PATH_MAX];
-    char link[PATH_MAX];
+    char path[PATH_MAX], link[PATH_MAX];
     snprintf(path, sizeof(path), "/sys/bus/pci/devices/%s/iommu_group", pci_addr);
-    
     ssize_t len = readlink(path, link, sizeof(link) - 1);
-    if (len == -1) {
-        perror("readlink (Is the device bound to vfio-pci?)");
-        return -1;
-    }
+    if (len == -1) return -1;
     link[len] = '\0';
     return atoi(basename(link));
 }
 
 int main(int argc, char *argv[]) {
-    if (argc < 2) {
-        printf("Usage: %s <pci_address>\n", argv[0]);
-        return 1;
-    }
-
+    if (argc < 2) { printf("Usage: %s <pci_address>\n", argv[0]); return 1; }
     const char *pci_addr = argv[1];
+
+    printf("[1] Locating IOMMU group for %s...\n", pci_addr);
     int group_id = get_group_id(pci_addr);
-    if (group_id < 0) return 1;
+    if (group_id < 0) { perror("Readlink failed"); return 1; }
 
-    int container, group, device;
-    char group_path[64];
-
-    // 1. Setup the Container
-    container = open("/dev/vfio/vfio", O_RDWR);
-    if (ioctl(container, VFIO_GET_API_VERSION) != VFIO_API_VERSION) {
-        fprintf(stderr, "Unknown VFIO API version\n");
-        return 1;
-    }
-
-    // 2. Open Group and attach to container
+    printf("[2] Initializing VFIO Container and Group %d...\n", group_id);
+    int container = open("/dev/vfio/vfio", O_RDWR);
+    int group = open("/dev/vfio/19", O_RDWR); // Placeholder, replaced below
+    char group_path[32];
     snprintf(group_path, sizeof(group_path), "/dev/vfio/%d", group_id);
     group = open(group_path, O_RDWR);
-    if (group < 0) {
-        perror("Failed to open group");
-        return 1;
-    }
+    
     ioctl(group, VFIO_GROUP_SET_CONTAINER, &container);
+    ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU);
+    int device = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, pci_addr);
 
-    // 3. Set IOMMU type (VFIO_TYPE1_IOMMU is standard for x86)
-    if (ioctl(container, VFIO_SET_IOMMU, VFIO_TYPE1_IOMMU) < 0) {
-        perror("Failed to set IOMMU type");
-        return 1;
-    }
-
-    // 4. Get the Device File Descriptor
-    device = ioctl(group, VFIO_GROUP_GET_DEVICE_FD, pci_addr);
-    if (device < 0) {
-        perror("Failed to get device FD");
-        return 1;
-    }
-
-    // 5. Query Identification
-    struct vfio_region_info config_reg = { .argsz = sizeof(config_reg), .index = VFIO_PCI_CONFIG_REGION_INDEX };
-    ioctl(device, VFIO_DEVICE_GET_REGION_INFO, &config_reg);
-
-    uint16_t vendor_id, device_id;
-    pread(device, &vendor_id, 2, config_reg.offset + 0);
-    pread(device, &device_id, 2, config_reg.offset + 2);
-
-    printf("\n=== Device Identification ===\n");
-    printf("Vendor ID: 0x%04X (VMware)\n", vendor_id);
-    printf("Device ID: 0x%04X (VMXNET3 Virtual Ethernet)\n", device_id);
-
-    // 6. Query and Map BAR0 (Registers)
+    printf("[3] Mapping BAR0 Registers...\n");
     struct vfio_region_info bar0_reg = { .argsz = sizeof(bar0_reg), .index = 0 };
     ioctl(device, VFIO_DEVICE_GET_REGION_INFO, &bar0_reg);
+    uint8_t *bar0 = mmap(NULL, bar0_reg.size, PROT_READ|PROT_WRITE, MAP_SHARED, device, bar0_reg.offset);
 
-    void *bar0_ptr = mmap(NULL, bar0_reg.size, PROT_READ | PROT_WRITE, 
-                          MAP_SHARED, device, bar0_reg.offset);
+    printf("[4] Allocating 64KB DMA Buffer and Mapping IOMMU...\n");
+    size_t dma_size = 64 * 1024;
+    void *vaddr = mmap(NULL, dma_size, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS|MAP_LOCKED, -1, 0);
+    uint64_t iova = 0x1000000;
+    struct vfio_iommu_type1_dma_map dma_map = {
+        .argsz = sizeof(dma_map), .vaddr = (uintptr_t)vaddr, .size = dma_size,
+        .iova = iova, .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE
+    };
+    ioctl(container, VFIO_IOMMU_MAP_DMA, &dma_map);
 
-    if (bar0_ptr == MAP_FAILED) {
-        perror("mmap BAR0 failed");
-    } else {
-        printf("\n=== Register Access ===\n");
-        printf("BAR0 Size: %llu bytes\n", (unsigned long long)bar0_reg.size);
-        printf("BAR0 Mapped at: %p\n", bar0_ptr);
-    }
+    printf("[5] Partitioning Memory: SharedData, TxRing, RxRing...\n");
+    Vmxnet3_DriverShared *shared = (Vmxnet3_DriverShared *)vaddr;
+    Vmxnet3_TxDesc *tx_ring = (Vmxnet3_TxDesc *)((uint8_t*)vaddr + 1024);
+    Vmxnet3_RxDesc *rx_ring = (Vmxnet3_RxDesc *)((uint8_t*)tx_ring + (RING_SIZE * sizeof(Vmxnet3_TxDesc)));
+    
+    memset(vaddr, 0, dma_size);
+    shared->magic = 0x544D4E58; // "XNMT" Magic
+    shared->dev_addr = iova;    // Tell device where this struct is (IOVA)
 
-    // 7. DMA Setup: Allocate and Map memory for the hardware
-    size_t dma_size = 4096 * 4; // Allocate 4 pages (16KB)
-    void *dma_vaddr = mmap(NULL, dma_size, PROT_READ | PROT_WRITE,
-                           MAP_PRIVATE | MAP_ANONYMOUS | MAP_LOCKED, -1, 0);
+    printf("[6] Resetting VMXNET3 Device...\n");
+    *(volatile uint32_t *)(bar0 + VMXNET3_REG_CMD) = VMXNET3_CMD_RESET_DEV;
 
-    if (dma_vaddr == MAP_FAILED) {
-        perror("DMA mmap failed");
-    } else {
-        struct vfio_iommu_type1_dma_map dma_map = {
-            .argsz = sizeof(dma_map),
-            .vaddr = (uintptr_t)dma_vaddr,
-            .size  = dma_size,
-            .iova  = 0x1000000, // IO Virtual Address starts at 16MB
-            .flags = VFIO_DMA_MAP_FLAG_READ | VFIO_DMA_MAP_FLAG_WRITE,
-        };
+    printf("[7] Retrieving MAC Address...\n");
+    *(volatile uint32_t *)(bar0 + VMXNET3_REG_CMD) = VMXNET3_CMD_GET_MAC;
+    uint32_t mac_low = *(volatile uint32_t *)(bar0 + VMXNET3_REG_MACL);
+    uint32_t mac_high = *(volatile uint32_t *)(bar0 + VMXNET3_REG_MACH);
+    printf("    MAC Address: %02x:%02x:%02x:%02x:%02x:%02x\n",
+           mac_low & 0xFF, (mac_low >> 8) & 0xFF, (mac_low >> 16) & 0xFF,
+           (mac_low >> 24) & 0xFF, mac_high & 0xFF, (mac_high >> 8) & 0xFF);
 
-        if (ioctl(container, VFIO_IOMMU_MAP_DMA, &dma_map) < 0) {
-            perror("VFIO_IOMMU_MAP_DMA failed");
-        } else {
-            printf("\n=== DMA Setup ===\n");
-            printf("DMA Buffer Allocated: %zu bytes\n", dma_size);
-            printf("Userspace Vaddr:      %p\n", dma_vaddr);
-            printf("Device IOVA:          0x%llx\n", dma_map.iova);
-        }
-    }
+    printf("[8] Activating Device (Linking SharedData IOVA)...\n");
+    // To activate, we write the IOVA of the DriverShared struct to the BAR
+    *(volatile uint32_t *)(bar0 + 0x28) = (uint32_t)iova;        // Low 32 bits
+    *(volatile uint32_t *)(bar0 + 0x30) = (uint32_t)(iova >> 32); // High 32 bits
+    *(volatile uint32_t *)(bar0 + VMXNET3_REG_CMD) = VMXNET3_CMD_ACTIVATE_DEV;
 
-    // Keep the program running for a moment so you can inspect /proc/self/maps
-    printf("\nPress Enter to exit and cleanup...");
+    uint32_t status = *(volatile uint32_t *)(bar0 + VMXNET3_REG_CMD);
+    if (status == 0) printf("    Activation Successful!\n");
+    else printf("    Activation status: 0x%X\n", status);
+
+    printf("\nDevice is LIVE. Press Enter to shutdown...\n");
     getchar();
 
-    // Cleanup
-    if (dma_vaddr != MAP_FAILED) munmap(dma_vaddr, dma_size);
-    if (bar0_ptr != MAP_FAILED) munmap(bar0_ptr, bar0_reg.size);
-    close(device);
-    close(group);
-    close(container);
-    
+    printf("[9] Cleaning up...\n");
+    *(volatile uint32_t *)(bar0 + VMXNET3_REG_CMD) = VMXNET3_CMD_RESET_DEV;
+    munmap(vaddr, dma_size);
+    munmap(bar0, bar0_reg.size);
+    close(device); close(group); close(container);
     return 0;
 }
