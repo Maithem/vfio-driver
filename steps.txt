@@ -14,3 +14,46 @@ lspci | grep -i vmware
 sudo modprobe vfio-pci
 echo "0000:02:00.0" | sudo tee /sys/bus/pci/devices/0000:02:00.0/driver/unbind
 echo "15ad 07b0" | sudo tee /sys/bus/pci/drivers/vfio-pci/new_id
+
+
+qemu-img create -f qcow2 toy-ubuntu.qcow2 20G
+cp /boot/vmlinuz-$(uname -r) ./vmlinuz
+cp /boot/initrd.img-$(uname -r) ./initrd.img
+chmod +r ./vmlinuz ./initrd.img
+
+qemu-system-x86_64 \
+  -M q35,accel=kvm,kernel-irqchip=split \
+  -device intel-iommu,intremap=on \
+  -m 2G \
+  -smp 2 \
+  -drive file=./toy-ubuntu.qcow2,format=qcow2 \
+  -cdrom /var/lib/libvirt/images/ubuntu-22.04.4-live-server-amd64.iso \
+  -device edu \
+  -net nic -net user \
+  -vga virtio \
+  -display gtk
+
+
+qemu-system-x86_64 \
+  -M q35,accel=kvm,kernel-irqchip=split \
+  -cpu host \
+  -m 2G \
+  -drive file=./toy-ubuntu.qcow2,format=qcow2 \
+  -device edu \
+  -device intel-iommu,intremap=on \
+  -display gtk
+
+qemu-system-x86_64 \
+  -M q35,accel=kvm,kernel-irqchip=split \
+  -cpu host \
+  -m 2G \
+  -smp 2 \
+  -drive file=./toy-ubuntu.qcow2,format=qcow2 \
+  -device edu \
+  -device intel-iommu,intremap=on \
+  -net nic \
+  -net user,hostfwd=tcp::2222-:22 \
+  -display gtk
+
+ssh tester@localhost -p 2222
+
