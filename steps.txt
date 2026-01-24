@@ -57,3 +57,15 @@ qemu-system-x86_64 \
 
 ssh tester@localhost -p 2222
 
+
+
+qemu-system-x86_64 \
+  -M q35,accel=kvm \
+  -cpu host \
+  -m 2G \
+  -smp 2 \
+  -drive file=./toy-ubuntu.qcow2,format=qcow2 \
+  -device edu \
+  -net nic \
+  -net user,hostfwd=tcp::2222-:22 \
+  -display gtk
